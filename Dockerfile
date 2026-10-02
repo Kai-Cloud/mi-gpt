@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 
 FROM base as release
 
-COPY app.js .
+COPY app.js voice-bridge.js ./
 COPY package.json .
 COPY --from=dist /app/dist ./dist
 COPY --from=dist /app/prisma ./prisma

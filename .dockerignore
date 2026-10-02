@@ -4,6 +4,7 @@
 # 只保留构建相关的文件
 !src
 !app.js
+!voice-bridge.js
 !package.json
 !pnpm-lock.yaml
 !tsconfig.json
