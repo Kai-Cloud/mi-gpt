@@ -1,6 +1,8 @@
 # 自定义语音后端桥接模式
 
-此 fork 增加一个可选的 v4.2.0 运行时适配：小爱音箱 → MiGPT → OpenAI-compatible 语音后端。后端可以连接具有独立人设、记忆和工具的 Agent；默认模式不变。
+此 fork 增加一个可选的 v4.2.0 运行时适配，主要用于对接 [lk-slc](https://github.com/LKChat/lk-slc) 项目的语音入口：小爱音箱 → MiGPT → OpenAI-compatible voice ingress → lk-slc bot → Agent。也可对接遵守同一协议的其他后端；默认模式不变。
+
+职责边界：MiGPT 只提交当前问题并播报回答；lk-slc 负责请求关联与 bot 路由，Agent 负责原有人设、记忆和工具。会话采用独立模式还是复用已授权用户的既有会话，由后端可信配置决定，本仓不保存个人 Agent 名称、真实部署地址或用户映射。lk-slc 仓库若受访问权限限制，需要相应授权才能查看。
 
 ## 配置
 
