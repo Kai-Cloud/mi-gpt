@@ -13,13 +13,18 @@ MIGPT_VOICE_BRIDGE=true
 OPENAI_BASE_URL=https://voice-gateway.example.com/v1
 OPENAI_API_KEY=REPLACE_WITH_YOUR_GATEWAY_KEY
 OPENAI_MODEL=voice-agent
+MIGPT_VOICE_TIMEOUT_MS=85000
 ```
 
-不要同时配置 `AZURE_OPENAI_API_KEY`，否则现有 wrapper 会选择 Azure 客户端。跨机器部署时，`localhost` 指向调用方自身，不是远端 Agent 所在主机。
+桥接模式使用镜像已安装的 OpenAI SDK 与 Node 20 原生 fetch，不使用 Azure wrapper，也不使用原 wrapper 的 HTTP 代理配置；请直接配置可达的 `OPENAI_BASE_URL`。跨机器部署时，`localhost` 指向调用方自身，不是远端 Agent 所在主机。
 
 启用后仅发送当前 `QueryMessage.text`，请求为一个 user message，`stream: true`；不带 MiGPT 人设、历史记忆、小爱原回答。跳过 MiGPT 的会话记忆初始化和两条内建人设修改命令，保留调用方自定义命令、音箱唤醒和 TTS；`client.start()` 原有数据库初始化仍存在。人设与持续对话由后端管理。
 
-入口应支持 OpenAI SSE `choices[].delta.content` 和 `[DONE]`。该模式本身不增加搜索能力：后端是否配置可用搜索工具必须独立验证。
+入口应支持 OpenAI SSE `choices[].delta.content`、成功终态 `finish_reason: "stop"` 和 `[DONE]`。适配器收齐成功终态后才交给真实音箱消费者，避免播报失败流中的半截回答。该模式本身不增加搜索能力：后端是否配置可用搜索工具必须独立验证。
+
+客户端总等待默认 85000 ms，可配置 1–360000 ms；应大于入口总预算，例如后端 bridge 300000、入口 330000、客户端 360000 ms，反代 read timeout 大于 330 秒且保留 SSE heartbeat。65 秒是后端 bridge 的可配置默认值，不是 MiGPT/模型的硬限制。SDK `timeout` 只覆盖取得响应头前的等待，因此适配器另设覆盖整个 SSE 消费的总计时器，`maxRetries: 0` 禁止自动重复提交。超时、HTTP/SSE 错误、网络中断返回简洁可播报错误提示并结束本轮；取消立即终止本地请求。远端运行与会话锁由后端期限/abort 清理，HTTP 取消不保证远端立即停止。
+
+v4.2.0 原 `chatWithStreamResponse` 把 `chatStream().then(...)` 放飞且不捕获迭代异常；仅 catch 创建流的 Promise 无法阻止进程退出。桥接实例不走该方法，而是完整捕获真实 SDK `for await` 的拒绝，提供兼容 `SpeakerAnswer` 的消费接口；不改全局原型或发布 bundle，关闭桥接时保持原模式。
 
 ## 在现有官方镜像上部署
 
@@ -44,7 +49,7 @@ OPENAI_MODEL=voice-agent
 node --test tests/voice-bridge.test.mjs
 ```
 
-测试依赖准备步骤见测试文件顶部；使用发布的 mi-gpt@4.2.0 bundle 和 openai@4.56.0 SDK，通过 loopback HTTP/SSE 验证真实请求格式。设备、持久化边界被替代，不会启动音箱或读取真实凭据。
+测试依赖准备步骤见测试文件顶部；使用发布的 mi-gpt@4.2.0 bundle 和 openai@4.56.0 SDK，通过 loopback HTTP/SSE 验证真实请求格式。子进程证明原 bundle 的未捕获 APIError 退出路径；回归覆盖 SSE 504、断流/截断、HTTP 502、响应头/流总超时、取消、下一问恢复和真实音箱消费接口。设备、持久化边界被替代，不会启动音箱或读取真实凭据。
 
 实际部署时逐层验证：收到音箱识别文字、后端关联到正确请求、取得最终回答、发送播报，再由用户确认实际听到。只有容器 running 或后端 HTTP 200 不能证明完整语音链路成功。
 

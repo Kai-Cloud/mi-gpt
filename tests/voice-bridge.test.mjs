@@ -7,13 +7,16 @@
 // npm install --prefix node_modules/.voice-bridge-test --no-save --package-lock=false --ignore-scripts openai@4.56.0
 // node --test tests/voice-bridge.test.mjs
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test as nodeTest } from 'node:test';
+const test = process.env.MIGPT_CRASH_CHILD ? () => {} : nodeTest;
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { createRequire, Module } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { runInThisContext, runInNewContext } from 'node:vm';
 import { createServer, Agent } from 'node:http';
 import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 
 const root = new URL('../', import.meta.url);
 const bundleURL = process.env.MIGPT_TEST_BUNDLE
@@ -21,6 +24,9 @@ const bundleURL = process.env.MIGPT_TEST_BUNDLE
   : new URL('node_modules/.voice-bridge-test/package/dist/index.cjs', root);
 const bundlePath = fileURLToPath(bundleURL);
 const requireBundle = createRequire(bundleURL);
+// Resolve the already installed SDK in the offline fixture, as /app does in Docker.
+process.env.NODE_PATH = join(dirname(requireBundle.resolve('openai')), '..');
+Module._initPaths();
 const { createClient } = await import(new URL('voice-bridge.js', root));
 
 function forbidden() { throw new Error('Unexpected database/filesystem/device access'); }
@@ -97,7 +103,7 @@ function sse(res) {
   res.writeHead(200, { 'content-type': 'text/event-stream' });
   res.write('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n');
   res.write('data: {"choices":[{"delta":{"content":"桥接"}}]}\n\n');
-  res.end('data: {"choices":[{"delta":{"content":"回答。"}}]}\n\ndata: [DONE]\n\n');
+  res.end('data: {"choices":[{"delta":{"content":"回答。"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
 }
 
 for (const flag of [undefined, 'false', 'TRUE']) {
@@ -160,6 +166,95 @@ test('bridge refuses a pre-existing singleton instead of leaving persona command
   const MiGPT = loadMiGPT();
   MiGPT.create(config());
   assert.throws(() => createClient(MiGPT, config(), { MIGPT_VOICE_BRIDGE: 'true' }), /before.*create/i);
+});
+
+if (process.env.MIGPT_CRASH_CHILD) {
+  // No process-level rejection handler: Node must take its normal crash path.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"error":{"message":"Voice response timed out","type":"timeout","code":504}}\n\ndata: [DONE]\n\n');
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  process.env.OPENAI_BASE_URL = `http://127.0.0.1:${server.address().port}/v1`;
+  process.env.OPENAI_API_KEY = 'fixture';
+  delete process.env.AZURE_OPENAI_API_KEY;
+  const MiGPT = loadMiGPT();
+  const client = createClient(MiGPT, config(), { MIGPT_VOICE_BRIDGE: 'true' });
+  const stream = process.env.MIGPT_CRASH_CHILD === 'original'
+    ? await client.ai.constructor.chatWithStreamResponse({ user: 'fixture', enableSearch: false })
+    : (await client.ai.ask({ text: 'fixture' })).stream;
+  await stream.getFinalResult();
+  server.closeAllConnections(); server.close();
+} else {
+  test('original release crashes after SSE data.error; adapter must survive detached rejection', () => {
+    for (const [mode, expected] of [['original', 1], ['fixed', 0]]) {
+      const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', fileURLToPath(import.meta.url)], {
+        env: { ...process.env, MIGPT_CRASH_CHILD: mode }, timeout: 8000, encoding: 'utf8',
+      });
+      assert.equal(child.status, expected, `${mode}: ${child.stderr}`);
+      if (mode === 'original') assert.match(child.stderr, /APIError|Voice response timed out/);
+    }
+  });
+}
+
+for (const failure of ['sse504', 'disconnect', 'truncated', 'http502', 'deadline', 'headers-timeout', 'cancel']) {
+  test(`bridge ${failure} ends this turn and next question succeeds without retries`, { timeout: 6000 }, async t => {
+    let count = 0;
+    let disconnected;
+    const closed = new Promise(resolve => { disconnected = resolve; });
+    const requests = await ingress(t, res => {
+      res.on('close', disconnected);
+      if (++count > 1) return sse(res);
+      if (failure === 'http502') { res.writeHead(502); res.end('{"error":{"message":"fixture"}}'); return; }
+      if (failure === 'headers-timeout') return;
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': waiting\n\n');
+      if (failure === 'sse504') res.end('data: {"error":{"message":"Voice response timed out","type":"timeout","code":504}}\n\ndata: [DONE]\n\n');
+      if (failure === 'truncated') res.end('data: {"choices":[{"delta":{"content":"不完整的回答"}}]}\n\n');
+      if (failure === 'disconnect') {
+        res.write('data: {"choices":[{"delta":{"content":"不完整的回答"}}]}\n\n');
+        setTimeout(() => res.destroy(), 30);
+      }
+    });
+    const client = createClient(loadMiGPT(), config(), { MIGPT_VOICE_BRIDGE: 'true', MIGPT_VOICE_TIMEOUT_MS: '150' });
+    const { stream } = await client.ai.ask({ text: '失败' });
+    if (failure === 'cancel') { await new Promise(r => setTimeout(r, 40)); stream.cancel(); }
+    const result = await stream.getFinalResult();
+    if (failure === 'cancel') assert.equal(result, undefined);
+    else assert.match(result, ['deadline', 'headers-timeout', 'sse504'].includes(failure) ? /超时/ : /失败/);
+    assert.equal(stream.getNextResponse().noMore, true);
+    if (failure === 'deadline' || failure === 'cancel') await closed;
+    const next = await client.ai.ask({ text: '下一问' });
+    assert.equal(await next.stream.getFinalResult(), '桥接回答。');
+    assert.equal(requests.length, 2, 'must never retry a voice request');
+  });
+}
+
+test('real bundle speaker consumes adapter error and next answer without device calls', async t => {
+  let calls = 0;
+  await ingress(t, res => {
+    if (++calls > 1) return sse(res);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"error":{"type":"timeout","code":504,"message":"timeout"}}\n\ndata: [DONE]\n\n');
+  });
+  const client = createClient(loadMiGPT(), config(), { MIGPT_VOICE_BRIDGE: 'true' });
+  const spoken = [];
+  client.speaker._response = async ({ text }) => { spoken.push(text); };
+  for (const streamResponse of [false, true]) {
+    client.speaker.streamResponse = streamResponse;
+    const answer = await client.ai.ask({ text: 'fixture' });
+    await client.speaker.response({ ...answer, playSFX: false, keepAlive: false });
+  }
+  assert.deepEqual(spoken, ['请求超时，请稍后重试。', '桥接回答。']);
+});
+
+test('bridge rejects invalid and unbounded client deadlines', () => {
+  for (const value of ['0', '-1', 'Infinity', 'NaN', '360001']) {
+    assert.throws(() => createClient(loadMiGPT(), config(), {
+      MIGPT_VOICE_BRIDGE: 'true', MIGPT_VOICE_TIMEOUT_MS: value,
+    }), /MIGPT_VOICE_TIMEOUT_MS/);
+  }
 });
 
 test('empty SSE terminates with no spoken result rather than waiting forever', { timeout: 5000 }, async (t) => {
